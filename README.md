@@ -1,4 +1,4 @@
-# Nuz & Denji Userplugins
+# Nuz & Denji's Userplugins
 
 A collection of custom Vencord userplugins created by **NuzFlameV2 and ItsDenji777**.
 
