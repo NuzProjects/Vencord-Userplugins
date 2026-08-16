@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import "./style.css";
 import "./styles.css";
 
 import { BadgePosition, ProfileBadge } from "@api/Badges";
@@ -142,7 +141,6 @@ const profileBadge: ProfileBadge = {
 export default definePlugin({
     name: "Staff Crowns",
     description: "Adds a Crown/Tag to Server Owners (or Admins/Management)",
-    authors: [{ name: "NuzFlameV2", id: 1248366351194652712n }],
     authors: [{ name: "NuzFlameV2", id: 1248366351194652712n },{ name: "ItsDenji777", id: 876433011866992680n}],
     settings,
     tags: ["Appearance", "Servers"],
@@ -150,7 +148,7 @@ export default definePlugin({
     userProfileBadge: profileBadge,
 
     renderMemberListDecorator({ type, user, isOwner }) {
-        if (!settings.store.showInMemberList) return null;
+        if (!settings.store.showInMemberList || !user) return null;
 
         const guildId = type === "guild" ? SelectedGuildStore.getGuildId() : undefined;
         const tier = getTier(user.id, guildId, isOwner);
