@@ -14,17 +14,27 @@ import { Constants, DraftStore, DraftType, RestAPI, showToast, Toasts, useState,
 const logger = new Logger("FakeForward");
 
 const DraftManager = findByPropsLazy("clearDraft", "saveDraft");
+const UploadStore = findByPropsLazy("getUploads");
 
 const busyChannels = new Set<string>();
 
 const settings = definePluginSettings({
-    sourceUserId: {
+    forwardMode: {
+        type: OptionType.SELECT,
+        description: "What type of ID are you providing?",
+        options: [
+            { label: "User ID (Sends via DM)", value: "USER" },
+            { label: "Channel ID (Group DM or Server)", value: "CHANNEL" }
+        ],
+        default: "USER"
+    },
+    sourceId: {
         type: OptionType.STRING,
-        displayName: "DM User ID",
-        description: "The user whose DM is used as the temporary forwarding source.",
+        displayName: "Target ID",
+        description: "The User ID or Channel ID to use as the temporary forwarding source.",
         default: "1513317540519219261",
         placeholder: "1513317540519219261",
-        isValid: (value: string) => /^\d{17,20}$/.test(value.trim()) || "Enter a valid Discord user ID."
+        isValid: (value: string) => /^\d{17,20}$/.test(value.trim()) || "Enter a valid Discord ID."
     }
 });
 
@@ -53,25 +63,52 @@ async function deleteSource(channelId: string, messageId: string) {
     });
 }
 
-async function openSourceDm() {
+async function getOrCreateSourceChannel() {
+    const targetId = settings.store.sourceId.trim();
+
+    if (settings.store.forwardMode === "CHANNEL") {
+        return targetId;
+    }
+
     const response = await RestAPI.post({
         url: "/users/@me/channels",
-        body: { recipient_id: settings.store.sourceUserId.trim() }
+        body: { recipient_id: targetId }
     });
 
     return response.body.id as string;
 }
 
-async function sendAsForward(destinationChannelId: string, content: string) {
+async function sendAsForward(destinationChannelId: string, content: string, uploads: any[]) {
     let sourceChannelId: string | undefined;
     let sourceId: string | undefined;
 
     try {
-        sourceChannelId = await openSourceDm();
+        sourceChannelId = await getOrCreateSourceChannel();
+
+        let body: any;
+        if (uploads && uploads.length > 0) {
+            body = new FormData();
+            const payload: any = {};
+            if (content && content.trim().length > 0) {
+                payload.content = content;
+            }
+            if (Object.keys(payload).length > 0) {
+                body.append("payload_json", JSON.stringify(payload));
+            }
+            uploads.forEach((upload, index) => {
+                const file = upload.item?.file || upload.file || upload.item;
+                const filename = upload.filename || upload.name || upload.item?.name || `file_${index}`;
+                if (file) {
+                    body.append(`files[${index}]`, file, filename);
+                }
+            });
+        } else {
+            body = { content };
+        }
 
         const source = await RestAPI.post({
             url: Constants.Endpoints.MESSAGES(sourceChannelId),
-            body: { content }
+            body
         });
 
         const createdSourceId = sourceId = source.body.id;
@@ -88,6 +125,9 @@ async function sendAsForward(destinationChannelId: string, content: string) {
         });
 
         DraftManager.clearDraft(destinationChannelId, DraftType.ChannelMessage);
+        if (UploadStore && typeof UploadStore.clearAll === "function") {
+            UploadStore.clearAll(destinationChannelId, DraftType.ChannelMessage);
+        }
 
         try {
             await deleteSource(sourceChannelId, createdSourceId);
@@ -112,6 +152,10 @@ async function sendAsForward(destinationChannelId: string, content: string) {
 
 const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId }, isAnyChat }) => {
     const draft = useStateFromStores([DraftStore], () => DraftStore.getDraft(channelId, DraftType.ChannelMessage));
+    const uploads = useStateFromStores(
+        [UploadStore].filter(Boolean),
+        () => (UploadStore && typeof UploadStore.getUploads === "function" ? UploadStore.getUploads(channelId, DraftType.ChannelMessage) : [])
+    );
     const [busy, setBusy] = useState(() => busyChannels.has(channelId));
 
     if (!isAnyChat) return null;
@@ -122,8 +166,8 @@ const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId }, i
             onClick={async () => {
                 if (busyChannels.has(channelId)) return;
 
-                if (!draft.length) {
-                    showToast("Type something first.", Toasts.Type.MESSAGE);
+                if (!draft.length && (!uploads || uploads.length === 0)) {
+                    showToast("Type something or attach a file first.", Toasts.Type.MESSAGE);
                     return;
                 }
 
@@ -131,7 +175,7 @@ const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId }, i
                 setBusy(true);
 
                 try {
-                    await sendAsForward(channelId, draft);
+                    await sendAsForward(channelId, draft, uploads);
                 } finally {
                     busyChannels.delete(channelId);
                     setBusy(false);

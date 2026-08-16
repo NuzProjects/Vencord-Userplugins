@@ -148,7 +148,8 @@ export default definePlugin({
     userProfileBadge: profileBadge,
 
     renderMemberListDecorator({ type, user, isOwner }) {
-        if (!settings.store.showInMemberList) return null;
+        // fix uwu: Added `|| !user` to prevent crashing when Discord renders loading placeholders
+        if (!settings.store.showInMemberList || !user) return null;
 
         const guildId = type === "guild" ? SelectedGuildStore.getGuildId() : undefined;
         const tier = getTier(user.id, guildId, isOwner);
