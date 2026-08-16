@@ -9,34 +9,45 @@ import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { Constants, DraftStore, DraftType, RestAPI, showToast, Toasts, useState, useStateFromStores } from "@webpack/common";
+import { Constants, DraftStore, DraftType, RestAPI, showToast, Toasts, UploadAttachmentStore, UploadManager, useState, useStateFromStores } from "@webpack/common";
 
 const logger = new Logger("FakeForward");
 
 const DraftManager = findByPropsLazy("clearDraft", "saveDraft");
-const UploadStore = findByPropsLazy("getUploads");
 
 const busyChannels = new Set<string>();
 
 const settings = definePluginSettings({
     forwardMode: {
         type: OptionType.SELECT,
-        description: "What type of ID are you providing?",
+        displayName: "Source type",
+        description: "Whether the temporary forwarding source is a user's DM or an existing channel.",
         options: [
-            { label: "User ID (Sends via DM)", value: "USER" },
-            { label: "Channel ID (Group DM or Server)", value: "CHANNEL" }
+            { label: "User ID (send through DM)", value: "USER" },
+            { label: "Channel ID (group DM or server)", value: "CHANNEL" }
         ],
         default: "USER"
     },
     sourceId: {
         type: OptionType.STRING,
-        displayName: "Target ID",
-        description: "The User ID or Channel ID to use as the temporary forwarding source.",
+        displayName: "Source ID",
+        description: "The user or channel ID to use as the temporary forwarding source.",
         default: "1513317540519219261",
         placeholder: "1513317540519219261",
         isValid: (value: string) => /^\d{17,20}$/.test(value.trim()) || "Enter a valid Discord ID."
     }
 });
+
+interface PendingUpload {
+    file?: Blob;
+    filename?: string;
+    item?: Blob | {
+        file?: Blob;
+        name?: string;
+    };
+    name?: string;
+    removeFromMsgDraft?: () => void;
+}
 
 const ForwardIcon: IconComponent = ({ height = 20, width = 20, className }) => (
     <svg
@@ -78,59 +89,99 @@ async function getOrCreateSourceChannel() {
     return response.body.id as string;
 }
 
-async function sendAsForward(destinationChannelId: string, content: string, uploads: any[]) {
+function getUploadFile(upload: PendingUpload) {
+    if (upload.file instanceof Blob) return upload.file;
+
+    const item = upload.item;
+    if (item instanceof Blob) return item;
+    if (item?.file instanceof Blob) return item.file;
+
+    return undefined;
+}
+
+function createSourceBody(content: string, uploads: PendingUpload[]) {
+    if (!uploads.length) return { content };
+
+    const formData = new FormData();
+    const attachments: Array<{ id: number; filename: string; }> = [];
+
+    uploads.forEach((upload, index) => {
+        const file = getUploadFile(upload);
+        if (!file) return;
+
+        const filename = upload.filename
+            ?? upload.name
+            ?? (!(upload.item instanceof Blob) ? upload.item?.name : undefined)
+            ?? (file instanceof File ? file.name : undefined)
+            ?? `file_${index}`;
+
+        attachments.push({ id: index, filename });
+        formData.append(`files[${index}]`, file, filename);
+    });
+
+    if (!attachments.length) {
+        throw new Error("The attached files could not be read.");
+    }
+
+    formData.append("payload_json", JSON.stringify({
+        ...(content.trim() ? { content } : {}),
+        attachments
+    }));
+
+    return formData;
+}
+
+function clearComposer(channelId: string, uploads: PendingUpload[]) {
+    try {
+        DraftManager.clearDraft(channelId, DraftType.ChannelMessage);
+    } catch (error) {
+        logger.error("Forward sent, but the text draft could not be cleared", error);
+    }
+
+    for (const upload of uploads) {
+        try {
+            upload.removeFromMsgDraft?.();
+        } catch (error) {
+            logger.error("Forward sent, but an attachment could not be removed from the draft", error);
+        }
+    }
+
+    try {
+        UploadManager.clearAll(channelId, DraftType.ChannelMessage);
+    } catch (error) {
+        logger.error("Forward sent, but the attachment manager could not be cleared", error);
+    }
+}
+
+async function sendAsForward(destinationChannelId: string, content: string, uploads: PendingUpload[]) {
     let sourceChannelId: string | undefined;
-    let sourceId: string | undefined;
+    let sourceMessageId: string | undefined;
 
     try {
         sourceChannelId = await getOrCreateSourceChannel();
 
-        let body: any;
-        if (uploads && uploads.length > 0) {
-            body = new FormData();
-            const payload: any = {};
-            if (content && content.trim().length > 0) {
-                payload.content = content;
-            }
-            if (Object.keys(payload).length > 0) {
-                body.append("payload_json", JSON.stringify(payload));
-            }
-            uploads.forEach((upload, index) => {
-                const file = upload.item?.file || upload.file || upload.item;
-                const filename = upload.filename || upload.name || upload.item?.name || `file_${index}`;
-                if (file) {
-                    body.append(`files[${index}]`, file, filename);
-                }
-            });
-        } else {
-            body = { content };
-        }
-
         const source = await RestAPI.post({
             url: Constants.Endpoints.MESSAGES(sourceChannelId),
-            body
+            body: createSourceBody(content, uploads)
         });
 
-        const createdSourceId = sourceId = source.body.id;
+        sourceMessageId = source.body.id as string;
 
         await RestAPI.post({
             url: Constants.Endpoints.MESSAGES(destinationChannelId),
             body: {
                 message_reference: {
                     type: 1,
-                    message_id: createdSourceId,
+                    message_id: sourceMessageId,
                     channel_id: sourceChannelId
                 }
             }
         });
 
-        DraftManager.clearDraft(destinationChannelId, DraftType.ChannelMessage);
-        if (UploadStore && typeof UploadStore.clearAll === "function") {
-            UploadStore.clearAll(destinationChannelId, DraftType.ChannelMessage);
-        }
+        clearComposer(destinationChannelId, uploads);
 
         try {
-            await deleteSource(sourceChannelId, createdSourceId);
+            await deleteSource(sourceChannelId, sourceMessageId);
         } catch (error) {
             logger.error("Forward sent, but the temporary source could not be deleted", error);
             showToast("Forward sent, but the temporary source message could not be deleted.", Toasts.Type.FAILURE);
@@ -138,35 +189,36 @@ async function sendAsForward(destinationChannelId: string, content: string, uplo
     } catch (error) {
         logger.error("Failed to create forward", error);
 
-        if (sourceChannelId && sourceId) {
+        if (sourceChannelId && sourceMessageId) {
             try {
-                await deleteSource(sourceChannelId, sourceId);
+                await deleteSource(sourceChannelId, sourceMessageId);
             } catch (deleteError) {
                 logger.error("Failed to clean up the temporary source", deleteError);
             }
         }
 
-        showToast("Could not create the forward. Your draft was kept.", Toasts.Type.FAILURE);
+        showToast("Could not create the forward. Your draft and attachments were kept.", Toasts.Type.FAILURE);
     }
 }
 
-const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId }, isAnyChat }) => {
-    const draft = useStateFromStores([DraftStore], () => DraftStore.getDraft(channelId, DraftType.ChannelMessage));
+const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId } }) => {
+    const draft = useStateFromStores(
+        [DraftStore],
+        () => DraftStore.getDraft(channelId, DraftType.ChannelMessage) ?? ""
+    );
     const uploads = useStateFromStores(
-        [UploadStore].filter(Boolean),
-        () => (UploadStore && typeof UploadStore.getUploads === "function" ? UploadStore.getUploads(channelId, DraftType.ChannelMessage) : [])
+        [UploadAttachmentStore],
+        () => (UploadAttachmentStore.getUploads(channelId, DraftType.ChannelMessage) ?? []) as PendingUpload[]
     );
     const [busy, setBusy] = useState(() => busyChannels.has(channelId));
 
-    if (!isAnyChat) return null;
-
     return (
         <ChatBarButton
-            tooltip={busy ? "Creating forward…" : "FakeForward"}
+            tooltip={busy ? "Creating forward..." : "Fake Forward"}
             onClick={async () => {
                 if (busyChannels.has(channelId)) return;
 
-                if (!draft.length && (!uploads || uploads.length === 0)) {
+                if (!draft.length && !uploads.length) {
                     showToast("Type something or attach a file first.", Toasts.Type.MESSAGE);
                     return;
                 }
@@ -193,7 +245,7 @@ const FakeForwardButton: ChatBarButtonFactory = ({ channel: { id: channelId }, i
 
 export default definePlugin({
     name: "Fake Forward",
-    description: "Send your chatbox text as a real forwarded message.",
+    description: "Send your chatbox text and attachments as a real forwarded message.",
     authors: [
         { name: "NuzFlameV2", id: 1248366351194652712n },
         { name: "ItsDenji777", id: 876433011866992680n }
