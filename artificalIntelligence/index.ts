@@ -231,7 +231,7 @@ export default definePlugin({
 
                 await askMistral(
                     ctx.channel.id,
-                    "Summarize this Discord conversation. Highlight the main topics, decisions, open questions, and action items. Do not invent details.",
+                    "Summarize this Discord conversation. Do not invent details. Respond formally, address the situation clearly, providing ample description.",
                     getContext(ctx.channel.id, count),
                     900
                 );
